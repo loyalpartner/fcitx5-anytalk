@@ -873,14 +873,25 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
                         session = Some((audio_worker, ws_task));
                         let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "recording" }).as_bytes()).await;
                     }
-                    ClientMsg::Stop | ClientMsg::Cancel => {
-                        info!("Received Stop/Cancel command");
+                    ClientMsg::Stop => {
+                        info!("Received Stop command");
                         if let Some((mut worker, ws_task)) = session.take() {
                             worker.stop.store(true, Ordering::Relaxed);
                             if let Some(join) = worker.join.take() {
                                 let _ = join.join();
                             }
                             let _ = ws_task.await;
+                        }
+                        let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "idle" }).as_bytes()).await;
+                    }
+                    ClientMsg::Cancel => {
+                        info!("Received Cancel command");
+                        if let Some((mut worker, ws_task)) = session.take() {
+                            worker.stop.store(true, Ordering::Relaxed);
+                            if let Some(join) = worker.join.take() {
+                                let _ = join.join();
+                            }
+                            ws_task.abort(); // Force abort for Cancel
                         }
                         let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "idle" }).as_bytes()).await;
                     }

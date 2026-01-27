@@ -41,6 +41,7 @@ private:
   IpcClient ipc_;
   AnyTalkConfig config_;
   bool recording_{false};
+  bool ignore_next_commit_{false};
   std::string last_text_;
   std::string current_state_{"idle"};
   std::unique_ptr<fcitx::SimpleAction> statusAction_;

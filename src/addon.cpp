@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <sys/prctl.h>
 #include <signal.h>
+#include <regex>
+#include <fcitx/userinterface.h>
 
 AnyTalkEngine::AnyTalkEngine(fcitx::Instance *instance)
   : instance_(instance) {
@@ -52,10 +54,8 @@ void AnyTalkEngine::startDaemon() {
         return;
     }
     
-    // Check if daemon needs to be started
     pid_t pid = fork();
     if (pid == 0) {
-        // Child process
         prctl(PR_SET_PDEATHSIG, SIGTERM);
         
         setenv("ANYTALK_APP_ID", config_.appId->c_str(), 1);
@@ -63,7 +63,7 @@ void AnyTalkEngine::startDaemon() {
         setenv("ANYTALK_RESOURCE_ID", "volc.seedasr.sauc.duration", 0);
         
         std::string path = *config_.daemonPath;
-        if (path.empty()) path = "anytalk-daemon"; // Fallback to PATH
+        if (path.empty()) path = "anytalk-daemon";
 
         execlp(path.c_str(), path.c_str(), nullptr);
         
@@ -93,7 +93,6 @@ void AnyTalkEngine::activate(const fcitx::InputMethodEntry &, fcitx::InputContex
 }
 
 void AnyTalkEngine::deactivate(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) {
-    // StatusArea is managed by InputContext
 }
 
 void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &event) {
@@ -108,7 +107,7 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
       ipc_.sendStop();
       recording_ = false;
       updateStatusItem(ic);
-      event.accept(); // Consume Enter so app doesn't get newline
+      event.accept();
       return;
   }
 
@@ -117,6 +116,7 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
     auto *ic = event.inputContext();
     if (!recording_) {
       FCITX_DEBUG() << "Trigger key pressed, sending start";
+      ignore_next_commit_ = false;
       ipc_.sendStart();
       recording_ = true;
     } else {
@@ -134,6 +134,31 @@ void AnyTalkEngine::updatePreedit(const std::string &text) {
   if (!instance_) {
     return;
   }
+  
+  // Check for "Over" command
+  // Matches: "blah. over", "blah, over" etc.
+  std::regex re(R"((。|\.|，|,|\s)\s*over[[:punct:]\s]*$)", std::regex::icase);
+  std::smatch match;
+  if (recording_ && std::regex_search(text, match, re)) {
+      FCITX_INFO() << "'Over' command detected. Stopping and committing.";
+      std::string cleanText = std::regex_replace(text, re, "$1");
+      
+      ignore_next_commit_ = true;
+      ipc_.sendCancel();
+      recording_ = false;
+      
+      if (instance_) {
+          auto *ic = instance_->inputContextManager().lastFocusedInputContext();
+          if (ic) {
+              ic->commitString(cleanText);
+              ic->inputPanel().setClientPreedit(fcitx::Text());
+              ic->updatePreedit();
+              updateStatusItem(ic);
+          }
+      }
+      return;
+  }
+
   last_text_ = text;
   auto *ic = instance_->inputContextManager().lastFocusedInputContext();
   if (!ic) {
@@ -145,6 +170,10 @@ void AnyTalkEngine::updatePreedit(const std::string &text) {
 }
 
 void AnyTalkEngine::commitText(const std::string &text) {
+  if (ignore_next_commit_) {
+      FCITX_DEBUG() << "Ignoring commit due to recent Over command";
+      return;
+  }
   if (!instance_) {
     return;
   }
@@ -181,7 +210,7 @@ void AnyTalkEngine::updateStatusItem(fcitx::InputContext *ic) {
 
   if (recording_ || current_state_ == "recording") {
     statusAction_->setShortText("REC");
-    statusAction_->setIcon("anytalk-rec"); 
+    statusAction_->setIcon("media-record"); 
   } else if (current_state_ == "connecting") {
     statusAction_->setShortText("...");
     statusAction_->setIcon("anytalk");
@@ -190,6 +219,8 @@ void AnyTalkEngine::updateStatusItem(fcitx::InputContext *ic) {
     statusAction_->setIcon("anytalk"); 
   }
   statusAction_->update(ic);
+  
+  ic->updateUserInterface(fcitx::UserInterfaceComponent::StatusArea);
 }
 
 class AnyTalkFactory : public fcitx::AddonFactory {
