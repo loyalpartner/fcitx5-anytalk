@@ -9,10 +9,23 @@ find_package(Fcitx5Utils REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC REQUIRED json-c)
 
+find_program(CARGO_EXECUTABLE cargo)
+if (NOT CARGO_EXECUTABLE)
+    message(FATAL_ERROR "cargo not found")
+endif()
+
+add_custom_target(anytalk-daemon-build ALL
+    COMMAND ${CARGO_EXECUTABLE} build --release
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/anytalk-daemon
+    COMMENT "Building Rust daemon"
+)
+
 add_library(anytalk MODULE
   src/addon.cpp
   src/ipc_client.cpp
 )
+
+add_dependencies(anytalk anytalk-daemon-build)
 
 target_include_directories(anytalk PRIVATE
   ${Fcitx5Core_INCLUDE_DIRS}
@@ -36,3 +49,4 @@ install(FILES data/anytalk.conf DESTINATION share/fcitx5/inputmethod)
 install(FILES data/anytalk-addon.conf DESTINATION share/fcitx5/addon RENAME anytalk.conf)
 file(GLOB ICONS "data/anytalk*.png")
 install(FILES ${ICONS} DESTINATION share/fcitx5/icons)
+install(PROGRAMS anytalk-daemon/target/release/anytalk-daemon DESTINATION bin)

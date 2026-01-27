@@ -903,18 +903,52 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
 }
 
 #[tokio::main]
+
 async fn main() -> IoResult<()> {
+
     env_logger::init();
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
+
 
     let path = socket_path();
+
+    
+
+    // Check if another instance is running
+
     if path.exists() {
-        let _ = std::fs::remove_file(&path);
+
+        match UnixStream::connect(&path).await {
+
+            Ok(_) => {
+
+                error!("Another instance of anytalk-daemon is already running.");
+
+                return Ok(());
+
+            }
+
+            Err(_) => {
+
+                warn!("Removing stale socket file: {}", path.display());
+
+                let _ = std::fs::remove_file(&path);
+
+            }
+
+        }
+
     }
+
+
+
     let listener = UnixListener::bind(&path)?;
+
     info!("anytalk-daemon listening on {}", path.display());
+
+
 
     loop {
         let (stream, _) = listener.accept().await?;
