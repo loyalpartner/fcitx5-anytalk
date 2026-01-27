@@ -107,6 +107,9 @@ void IpcClient::recvLoop() {
     if (n <= 0) {
       ::close(sock_);
       sock_ = -1;
+      if (on_status_) {
+          on_status_("idle");
+      }
       continue;
     }
     buf[n] = '\0';

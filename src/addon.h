@@ -15,7 +15,19 @@ FCITX_CONFIGURATION(
     fcitx::Option<std::string> daemonPath{this, "DaemonPath", "Path to anytalk-daemon executable", "/usr/bin/anytalk-daemon"};
 );
 
-class AnyTalkEngine : public fcitx::InputMethodEngine {
+class AnyTalkEngine;
+
+class AnyTalkStatusAction : public fcitx::Action {
+public:
+    AnyTalkStatusAction(AnyTalkEngine *engine);
+    std::string shortText(fcitx::InputContext *ic) const override;
+    std::string icon(fcitx::InputContext *ic) const override;
+    // We can also implement activate() here if clicking the icon should toggle recording!
+private:
+    AnyTalkEngine *engine_;
+};
+
+class AnyTalkEngine : public fcitx::InputMethodEngineV2 {
 public:
   AnyTalkEngine(fcitx::Instance *instance);
   ~AnyTalkEngine();
@@ -33,8 +45,15 @@ public:
   void updatePreedit(const std::string &text);
   void commitText(const std::string &text);
   void setStatus(const std::string &state);
-  void updateStatusItem(fcitx::InputContext *ic);
   void startDaemon();
+  
+  // V2 Overrides for Main Icon/Label
+  std::string subModeIconImpl(const fcitx::InputMethodEntry &entry, fcitx::InputContext &ic) override;
+  std::string subModeLabelImpl(const fcitx::InputMethodEntry &entry, fcitx::InputContext &ic) override;
+
+  // Accessors for StatusAction
+  bool isRecording() const { return recording_; }
+  std::string connectionState() const { return current_state_; }
 
 private:
   fcitx::Instance *instance_;
@@ -44,5 +63,5 @@ private:
   bool ignore_next_commit_{false};
   std::string last_text_;
   std::string current_state_{"idle"};
-  std::unique_ptr<fcitx::SimpleAction> statusAction_;
+  std::unique_ptr<AnyTalkStatusAction> statusAction_;
 };

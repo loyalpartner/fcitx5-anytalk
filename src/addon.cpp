@@ -12,6 +12,30 @@
 #include <regex>
 #include <fcitx/userinterface.h>
 
+// --- AnyTalkStatusAction Implementation ---
+
+AnyTalkStatusAction::AnyTalkStatusAction(AnyTalkEngine *engine) : engine_(engine) {
+}
+
+std::string AnyTalkStatusAction::shortText(fcitx::InputContext *ic) const {
+    if (engine_->isRecording()) {
+        return "REC";
+    }
+    if (engine_->connectionState() == "connecting") {
+        return "...";
+    }
+    return "AT";
+}
+
+std::string AnyTalkStatusAction::icon(fcitx::InputContext *ic) const {
+    if (engine_->isRecording()) {
+        return "media-record"; // Use system record icon or "anytalk-rec"
+    }
+    return "anytalk";
+}
+
+// --- AnyTalkEngine Implementation ---
+
 AnyTalkEngine::AnyTalkEngine(fcitx::Instance *instance)
   : instance_(instance) {
   ipc_.setCallbacks(
@@ -36,9 +60,7 @@ AnyTalkEngine::AnyTalkEngine(fcitx::Instance *instance)
   );
   ipc_.start();
 
-  statusAction_ = std::make_unique<fcitx::SimpleAction>();
-  statusAction_->setShortText("AT");
-  statusAction_->setIcon("anytalk");
+  statusAction_ = std::make_unique<AnyTalkStatusAction>(this);
   
   reloadConfig();
   startDaemon();
@@ -46,6 +68,37 @@ AnyTalkEngine::AnyTalkEngine(fcitx::Instance *instance)
 
 AnyTalkEngine::~AnyTalkEngine() {
   ipc_.stop();
+}
+
+// Helper to trigger UI refresh
+void AnyTalkEngine::setStatus(const std::string &state) {
+  current_state_ = state;
+  if (state == "idle") {
+    recording_ = false;
+  } else if (state == "recording") {
+    recording_ = true;
+  }
+  
+  if (instance_) {
+     auto *ic = instance_->inputContextManager().lastFocusedInputContext();
+     if (ic) {
+         statusAction_->update(ic);
+         ic->updateUserInterface(fcitx::UserInterfaceComponent::StatusArea);
+         // Also update input panel if needed, but StatusArea covers icons/labels
+     }
+  }
+}
+
+// V2 Overrides for Main Icon/Label
+std::string AnyTalkEngine::subModeIconImpl(const fcitx::InputMethodEntry &, fcitx::InputContext &) {
+    if (recording_) return "media-record";
+    return "anytalk";
+}
+
+std::string AnyTalkEngine::subModeLabelImpl(const fcitx::InputMethodEntry &, fcitx::InputContext &) {
+    if (recording_) return "REC";
+    if (current_state_ == "connecting") return "...";
+    return "AT";
 }
 
 void AnyTalkEngine::startDaemon() {
@@ -66,13 +119,7 @@ void AnyTalkEngine::startDaemon() {
         if (path.empty()) path = "anytalk-daemon";
 
         execlp(path.c_str(), path.c_str(), nullptr);
-        
-        FCITX_ERROR() << "Failed to exec anytalk-daemon at " << path;
         _exit(1);
-    } else if (pid > 0) {
-        FCITX_INFO() << "Started anytalk-daemon with PID " << pid;
-    } else {
-        FCITX_ERROR() << "Failed to fork anytalk-daemon";
     }
 }
 
@@ -89,10 +136,12 @@ void AnyTalkEngine::activate(const fcitx::InputMethodEntry &, fcitx::InputContex
     auto *ic = event.inputContext();
     if (!ic) return;
     ic->statusArea().addAction(fcitx::StatusGroup::InputMethod, statusAction_.get());
-    updateStatusItem(ic);
+    
+    // Refresh UI on activate
+    statusAction_->update(ic);
 }
 
-void AnyTalkEngine::deactivate(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) {
+void AnyTalkEngine::deactivate(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &) {
 }
 
 void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &event) {
@@ -100,127 +149,69 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
     return;
   }
 
-  // Enter key: Stop recording and commit immediately
+  auto *ic = event.inputContext();
+
+  // Enter key
   if (event.key().sym() == FcitxKey_Return && recording_) {
-      auto *ic = event.inputContext();
       FCITX_DEBUG() << "Enter pressed, stopping recording";
       ipc_.sendStop();
       recording_ = false;
-      updateStatusItem(ic);
+      
+      // Update UI immediately
+      setStatus("idle"); // This triggers refresh
       event.accept();
       return;
   }
 
-  // F2 or Media Play key: Toggle recording
+  // F2 or Media Play key
   if (event.key().sym() == FcitxKey_F2 || event.key().sym() == FcitxKey_AudioPlay) {
-    auto *ic = event.inputContext();
     if (!recording_) {
-      FCITX_DEBUG() << "Trigger key pressed, sending start";
       ignore_next_commit_ = false;
       ipc_.sendStart();
-      recording_ = true;
+      setStatus("connecting"); // Optimistic update
     } else {
-      FCITX_DEBUG() << "Trigger key pressed, sending stop";
       ipc_.sendStop();
-      recording_ = false;
+      setStatus("idle"); // Optimistic update
     }
-    updateStatusItem(ic);
     event.accept();
     return;
   }
 }
 
 void AnyTalkEngine::updatePreedit(const std::string &text) {
-  if (!instance_) {
-    return;
-  }
+  if (!instance_) return;
   
-  // Check for "Over" command
-  // Matches: "blah. over", "blah, over" etc.
   std::regex re(R"((。|\.|，|,|\s)\s*over[[:punct:]\s]*$)", std::regex::icase);
   std::smatch match;
   if (recording_ && std::regex_search(text, match, re)) {
-      FCITX_INFO() << "'Over' command detected. Stopping and committing.";
       std::string cleanText = std::regex_replace(text, re, "$1");
       
       ignore_next_commit_ = true;
       ipc_.sendCancel();
       recording_ = false;
       
-      if (instance_) {
-          auto *ic = instance_->inputContextManager().lastFocusedInputContext();
-          if (ic) {
-              ic->commitString(cleanText);
-              ic->inputPanel().setClientPreedit(fcitx::Text());
-              ic->updatePreedit();
-              updateStatusItem(ic);
-          }
-      }
+      commitText(cleanText);
+      setStatus("idle");
       return;
   }
 
   last_text_ = text;
   auto *ic = instance_->inputContextManager().lastFocusedInputContext();
-  if (!ic) {
-    return;
-  }
+  if (!ic) return;
   fcitx::Text preedit(text);
   ic->inputPanel().setClientPreedit(preedit);
   ic->updatePreedit();
 }
 
 void AnyTalkEngine::commitText(const std::string &text) {
-  if (ignore_next_commit_) {
-      FCITX_DEBUG() << "Ignoring commit due to recent Over command";
-      return;
-  }
-  if (!instance_) {
-    return;
-  }
+  if (ignore_next_commit_) return;
+  if (!instance_) return;
   last_text_ = "";
   auto *ic = instance_->inputContextManager().lastFocusedInputContext();
-  if (!ic) {
-    return;
-  }
+  if (!ic) return;
   ic->commitString(text);
   ic->inputPanel().setClientPreedit(fcitx::Text());
   ic->updatePreedit();
-}
-
-void AnyTalkEngine::setStatus(const std::string &state) {
-  current_state_ = state;
-  if (state == "idle") {
-    recording_ = false;
-  } else if (state == "recording") {
-    recording_ = true;
-  }
-  
-  if (instance_) {
-     auto *ic = instance_->inputContextManager().lastFocusedInputContext();
-     if (ic) {
-         updateStatusItem(ic);
-     }
-  }
-}
-
-void AnyTalkEngine::updateStatusItem(fcitx::InputContext *ic) {
-  if (!statusAction_ || !ic) {
-    return;
-  }
-
-  if (recording_ || current_state_ == "recording") {
-    statusAction_->setShortText("REC");
-    statusAction_->setIcon("media-record"); 
-  } else if (current_state_ == "connecting") {
-    statusAction_->setShortText("...");
-    statusAction_->setIcon("anytalk");
-  } else {
-    statusAction_->setShortText("AT");
-    statusAction_->setIcon("anytalk"); 
-  }
-  statusAction_->update(ic);
-  
-  ic->updateUserInterface(fcitx::UserInterfaceComponent::StatusArea);
 }
 
 class AnyTalkFactory : public fcitx::AddonFactory {
