@@ -185,11 +185,6 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
     if (!recording_) {
       ignore_next_commit_ = false;
       ipc_.sendStart();
-      // Don't set "connecting" blindly if we might be "connected" already.
-      // But sendStart will trigger daemon to send "recording" or "connecting".
-      // Let's just let the daemon drive the state updates to avoid flickering "..." if it's instant.
-      // But for responsiveness, "..." is okay. 
-      // Actually, if we are "connected", it should jump to "recording" very fast.
       if (current_state_ != "connected") {
           setStatus("connecting"); 
       }
@@ -205,20 +200,6 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
 void AnyTalkEngine::updatePreedit(const std::string &text) {
   if (!instance_) return;
   
-  std::regex re(R"((。|\.|，|,|\s)\s*over[[:punct:]\s]*$)", std::regex::icase);
-  std::smatch match;
-  if (recording_ && std::regex_search(text, match, re)) {
-      std::string cleanText = std::regex_replace(text, re, "$1");
-      
-      ignore_next_commit_ = true;
-      ipc_.sendCancel();
-      recording_ = false;
-      
-      commitText(cleanText);
-      setStatus("idle");
-      return;
-  }
-
   last_text_ = text;
   auto *ic = instance_->inputContextManager().lastFocusedInputContext();
   if (!ic) return;

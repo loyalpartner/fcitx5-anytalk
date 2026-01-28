@@ -6,13 +6,12 @@ use std::env;
 use std::io::Result as IoResult;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -67,12 +66,154 @@ struct AsrConfig {
 #[derive(Debug)]
 enum AudioMsg {
     Chunk(Vec<u8>),
-    End(Vec<u8>),
 }
 
-struct AudioWorker {
-    stop: Arc<AtomicBool>,
-    join: Option<std::thread::JoinHandle<()>>,
+/// Shared controller for the global audio stream.
+/// Safe to share between threads.
+#[derive(Clone)]
+struct AudioController {
+    /// The current target for audio data. If None, data is dropped.
+    target: Arc<Mutex<Option<mpsc::Sender<AudioMsg>>>>,
+}
+
+impl AudioController {
+    fn new() -> Self {
+        Self {
+            target: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn set_target(&self, tx: mpsc::Sender<AudioMsg>) {
+        let mut lock = self.target.lock().unwrap();
+        *lock = Some(tx);
+    }
+
+    fn clear_target(&self) {
+        let mut lock = self.target.lock().unwrap();
+        *lock = None;
+    }
+}
+
+/// Starts the global audio stream and returns the stream handle (must be kept alive) and the controller.
+fn start_global_audio() -> Result<(cpal::Stream, AudioController), String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "no input device".to_string())?;
+    let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+    info!("Using default input device (Persistent): {}", device_name);
+
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("input config error: {e}"))?;
+    info!("Default input config: {:?}", config);
+
+    let channels = config.channels() as usize;
+    let in_rate = config.sample_rate().0 as usize;
+    
+    let controller = AudioController::new();
+    // We only share the `target` part with the stream callback, which is thread-safe logic.
+    let target_for_stream = controller.target.clone();
+
+    let err_fn = |err| error!("audio stream error: {err}");
+    
+    let mut resampler = StreamingResampler::new(in_rate, 16000);
+    // Buffer for resampling accumulation
+    let mut buffer: Vec<i16> = Vec::new();
+    // 200ms chunks at 16000Hz = 3200 samples
+    let chunk_samples = 16000 * 200 / 1000;
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _| {
+                process_f32(data, &mut buffer, &mut resampler, channels, chunk_samples, &target_for_stream);
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config.into(),
+            move |data: &[i16], _| {
+                process_i16(data, &mut buffer, &mut resampler, channels, chunk_samples, &target_for_stream);
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config.into(),
+            move |data: &[u16], _| {
+                process_u16(data, &mut buffer, &mut resampler, channels, chunk_samples, &target_for_stream);
+            },
+            err_fn,
+            None,
+        ),
+        _ => return Err("unsupported sample format".to_string()),
+    }.map_err(|e| format!("failed to build stream: {e}"))?;
+
+    stream.play().map_err(|e| format!("failed to play stream: {e}"))?;
+    info!("Audio stream started and running in background.");
+
+    Ok((stream, controller))
+}
+
+// Processing helpers
+fn process_f32(
+    data: &[f32], 
+    buffer: &mut Vec<i16>, 
+    resampler: &mut StreamingResampler, 
+    channels: usize, 
+    chunk_samples: usize, 
+    target: &Mutex<Option<mpsc::Sender<AudioMsg>>>
+) {
+    let lock = target.lock().unwrap();
+    if lock.is_none() {
+        buffer.clear(); // Keep buffer clean to avoid stale audio
+        return; 
+    }
+    
+    let mut samples: Vec<i16> = Vec::with_capacity(data.len());
+    for &s in data {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        samples.push(v);
+    }
+    push_samples(buffer, resampler, channels, &samples, chunk_samples, lock.as_ref().unwrap());
+}
+
+fn process_i16(
+    data: &[i16], 
+    buffer: &mut Vec<i16>, 
+    resampler: &mut StreamingResampler, 
+    channels: usize, 
+    chunk_samples: usize, 
+    target: &Mutex<Option<mpsc::Sender<AudioMsg>>>
+) {
+    let lock = target.lock().unwrap();
+    if lock.is_none() {
+        buffer.clear();
+        return; 
+    }
+    push_samples(buffer, resampler, channels, data, chunk_samples, lock.as_ref().unwrap());
+}
+
+fn process_u16(
+    data: &[u16], 
+    buffer: &mut Vec<i16>, 
+    resampler: &mut StreamingResampler, 
+    channels: usize, 
+    chunk_samples: usize, 
+    target: &Mutex<Option<mpsc::Sender<AudioMsg>>>
+) {
+    let lock = target.lock().unwrap();
+    if lock.is_none() {
+        buffer.clear();
+        return; 
+    }
+    let mut samples: Vec<i16> = Vec::with_capacity(data.len());
+    for &s in data {
+        samples.push(((s as i32) - 32768) as i16);
+    }
+    push_samples(buffer, resampler, channels, &samples, chunk_samples, lock.as_ref().unwrap());
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -80,7 +221,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// Manages a single "hot spare" connection.
 struct ConnectionPool {
     /// The pre-connected stream.
-    spare: Arc<Mutex<Option<WsStream>>>,
+    spare: Arc<TokioMutex<Option<WsStream>>>,
     /// Notify when the spare is consumed, so the background task can reconnect.
     notify_consumed: Arc<Notify>,
     /// Config to use for connecting.
@@ -90,7 +231,7 @@ struct ConnectionPool {
 impl ConnectionPool {
     fn new(config: AsrConfig) -> Self {
         Self {
-            spare: Arc::new(Mutex::new(None)),
+            spare: Arc::new(TokioMutex::new(None)),
             notify_consumed: Arc::new(Notify::new()),
             config,
         }
@@ -138,6 +279,41 @@ impl ConnectionPool {
             sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+async fn connect_to_asr(cfg: &AsrConfig) -> Result<WsStream, String> {
+    let url = asr_url(&cfg.mode);
+    debug!("Dialing ASR: {}", url);
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("ws request error: {e}"))?;
+    {
+        let headers = request.headers_mut();
+        headers.insert(
+            "X-Api-App-Key",
+            cfg.app_id.parse().map_err(|_| "bad app id")?,
+        );
+        headers.insert(
+            "X-Api-Access-Key",
+            cfg.access_token.parse().map_err(|_| "bad access token")?,
+        );
+        headers.insert(
+            "X-Api-Resource-Id",
+            cfg.resource_id.parse().map_err(|_| "bad resource id")?,
+        );
+        headers.insert(
+            "X-Api-Connect-Id",
+            uuid::Uuid::new_v4() 
+                .to_string()
+                .parse()
+                .map_err(|_| "bad uuid")?,
+        );
+    }
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| format!("ws connect error: {e}"))?;
+    Ok(ws_stream)
 }
 
 fn socket_path() -> PathBuf {
@@ -433,137 +609,6 @@ fn i16_to_le_bytes(samples: &[i16]) -> Vec<u8> {
     out
 }
 
-fn start_audio_worker() -> Result<(AudioWorker, mpsc::Receiver<AudioMsg>), String> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no input device".to_string())?;
-    let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
-    info!("Using default input device: {}", device_name);
-
-    let config = device
-        .default_input_config()
-        .map_err(|e| format!("input config error: {e}"))?;
-    info!("Default input config: {:?}", config);
-
-    let channels = config.channels() as usize;
-    let in_rate = config.sample_rate().0 as usize;
-    let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel(16);
-    let stop_for_thread = stop.clone();
-
-    let join = std::thread::spawn(move || {
-        let stop_flag = stop_for_thread.clone();
-        let buffer = Arc::new(std::sync::Mutex::new(Vec::<i16>::new()));
-        let mut resampler = StreamingResampler::new(in_rate, 16000);
-        let chunk_samples = 16000 * 200 / 1000;
-
-        let err_fn = |err| error!("audio error: {err}");
-        let tx_audio = tx.clone();
-        let stop_for_stream = stop_flag.clone();
-        let buffer_for_stream = Arc::clone(&buffer);
-        let tx_for_stream = tx_audio.clone();
-
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[f32], _| {
-                        if stop_for_stream.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let mut buffer = buffer_for_stream.lock().unwrap();
-                        let mut samples: Vec<i16> = Vec::with_capacity(data.len());
-                        for &s in data {
-                            let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                            samples.push(v);
-                        }
-                        push_samples(
-                            &mut buffer,
-                            &mut resampler,
-                            channels,
-                            &samples,
-                            chunk_samples,
-                            &tx_for_stream,
-                        );
-                    },
-                    err_fn,
-                    None,
-                )
-                .ok(),
-            cpal::SampleFormat::I16 => device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[i16], _| {
-                        if stop_for_stream.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let mut buffer = buffer_for_stream.lock().unwrap();
-                        push_samples(
-                            &mut buffer,
-                            &mut resampler,
-                            channels,
-                            data,
-                            chunk_samples,
-                            &tx_for_stream,
-                        );
-                    },
-                    err_fn,
-                    None,
-                )
-                .ok(),
-            cpal::SampleFormat::U16 => device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[u16], _| {
-                        if stop_for_stream.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let mut buffer = buffer_for_stream.lock().unwrap();
-                        let mut samples: Vec<i16> = Vec::with_capacity(data.len());
-                        for &s in data {
-                            samples.push(((s as i32) - 32768) as i16);
-                        }
-                        push_samples(
-                            &mut buffer,
-                            &mut resampler,
-                            channels,
-                            &samples,
-                            chunk_samples,
-                            &tx_for_stream,
-                        );
-                    },
-                    err_fn,
-                    None,
-                )
-                .ok(),
-            _ => None,
-        };
-
-        if let Some(stream) = stream {
-            if stream.play().is_err() {
-                eprintln!("audio play error");
-            }
-            while !stop_flag.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            let remainder = buffer.lock().unwrap().clone();
-            let bytes = i16_to_le_bytes(&remainder);
-            let _ = tx_audio.blocking_send(AudioMsg::End(bytes));
-        } else {
-            eprintln!("unsupported sample format");
-        }
-    });
-
-    Ok((
-        AudioWorker {
-            stop,
-            join: Some(join),
-        },
-        rx,
-    ))
-}
-
 fn push_samples(
     buffer: &mut Vec<i16>,
     resampler: &mut StreamingResampler,
@@ -590,43 +635,9 @@ fn push_samples(
     while buffer.len() >= chunk_samples {
         let chunk = buffer.drain(..chunk_samples).collect::<Vec<_>>();
         let bytes = i16_to_le_bytes(&chunk);
-        let _ = tx.blocking_send(AudioMsg::Chunk(bytes));
+        // Use try_send to avoid blocking the audio thread if channel is full/closed
+        let _ = tx.try_send(AudioMsg::Chunk(bytes));
     }
-}
-
-async fn connect_to_asr(cfg: &AsrConfig) -> Result<WsStream, String> {
-    let url = asr_url(&cfg.mode);
-    debug!("Dialing ASR: {}", url);
-    let mut request = url
-        .into_client_request()
-        .map_err(|e| format!("ws request error: {e}"))?;
-    {
-        let headers = request.headers_mut();
-        headers.insert(
-            "X-Api-App-Key",
-            cfg.app_id.parse().map_err(|_| "bad app id")?,
-        );
-        headers.insert(
-            "X-Api-Access-Key",
-            cfg.access_token.parse().map_err(|_| "bad access token")?,
-        );
-        headers.insert(
-            "X-Api-Resource-Id",
-            cfg.resource_id.parse().map_err(|_| "bad resource id")?,
-        );
-        headers.insert(
-            "X-Api-Connect-Id",
-            uuid::Uuid::new_v4()
-                .to_string()
-                .parse()
-                .map_err(|_| "bad uuid")?,
-        );
-    }
-
-    let (ws_stream, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| format!("ws connect error: {e}"))?;
-    Ok(ws_stream)
 }
 
 async fn run_session(
@@ -665,14 +676,14 @@ async fn run_session(
                             audio_active = false;
                         }
                     }
-                    Some(AudioMsg::End(bytes)) => {
-                        debug!("Sending final audio chunk");
-                        let frame = build_audio_only_request(&bytes, true);
-                        let _ = ws_write.send(Message::Binary(frame)).await;
-                        audio_active = false;
-                    }
                     None => {
-                        debug!("Audio source channel closed");
+                        debug!("Audio source channel closed (Stop received)");
+                        // IMPORTANT: Send an empty chunk with last=true to tell ASR we are done.
+                        let empty = Vec::new();
+                        let frame = build_audio_only_request(&empty, true);
+                        if let Err(e) = ws_write.send(Message::Binary(frame)).await {
+                             warn!("Failed to send final frame: {}", e);
+                        }
                         audio_active = false;
                     }
                 }
@@ -711,7 +722,7 @@ async fn run_session(
                         info!("WebSocket closed by server");
                         break;
                     }
-                    Some(Ok(_)) => {},
+                    Some(Ok(_)) => {{}},
                     Some(Err(e)) => {
                         error!("WebSocket error: {}", e);
                         break;
@@ -756,7 +767,8 @@ fn parse_asr_texts(
             if end_time <= *last_committed_end_time {
                 debug!(
                     "Skipping definite utterance: end_time {} <= last {}",
-                    end_time, last_committed_end_time
+                    end_time,
+                    last_committed_end_time
                 );
                 continue;
             }
@@ -812,14 +824,14 @@ fn serialize_msg(msg: ServerMsg<'_>) -> String {
     line
 }
 
-async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, cfg: AsrConfig) -> IoResult<()> {
+async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, audio_ctrl: AudioController, cfg: AsrConfig) -> IoResult<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
 
     let (resp_tx, mut resp_rx) = mpsc::channel::<String>(32);
 
-    // Active session: (AudioWorker, WebSocketTask)
-    let mut session: Option<(AudioWorker, tokio::task::JoinHandle<()>)> = None;
+    // Active session: (WebSocketTask)
+    let mut session: Option<tokio::task::JoinHandle<()>> = None;
     // Task from a previous session that was stopped but is still finishing up (processing final results)
     let mut draining_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -850,23 +862,16 @@ async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, cfg: AsrCo
                         info!("Received Start command");
                         
                         // 1. If there's a draining task (previous session finishing up), abort it.
-                        //    The user wants to start NOW, so we discard old results.
                         if let Some(task) = draining_task.take() {
                             info!("Aborting draining task from previous session");
                             task.abort();
                         }
 
                         // 2. If there's an active session, abort it too (force restart).
-                        if let Some((mut worker, task)) = session.take() {
+                        if let Some(task) = session.take() {
                             warn!("Aborting active session for new Start");
-                            worker.stop.store(true, Ordering::Relaxed);
-                            // We don't join audio thread here to avoid blocking, 
-                            // strictly speaking we should, but aborting the task usually is enough 
-                            // as the audio worker relies on the channel which will close.
-                            // Better: join it if possible, but keep it quick.
-                            if let Some(join) = worker.join.take() {
-                                let _ = join.join();
-                            }
+                            // IMPORTANT: Stop audio flow first!
+                            audio_ctrl.clear_target();
                             task.abort();
                         }
 
@@ -891,14 +896,12 @@ async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, cfg: AsrCo
                             }
                         };
                         
-                        let (audio_worker, audio_rx) = match start_audio_worker() {
-                            Ok(v) => v,
-                            Err(err) => {
-                                error!("Audio worker error: {}", err);
-                                let _ = write_half.write_all(serialize_msg(ServerMsg::Error { message: &err }).as_bytes()).await;
-                                continue;
-                            }
-                        };
+                        // Prepare Audio Channel
+                        let (audio_tx, audio_rx) = mpsc::channel(16);
+                        
+                        // Route global audio to this channel
+                        audio_ctrl.set_target(audio_tx);
+
                         let resp_tx_clone = resp_tx.clone();
                         let cfg_clone = cfg.clone();
                         let ws_task = tokio::spawn(async move {
@@ -913,34 +916,27 @@ async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, cfg: AsrCo
                                 .send(serialize_msg(ServerMsg::Status { state: "idle" }))
                                 .await;
                         });
-                        session = Some((audio_worker, ws_task));
+                        session = Some(ws_task);
                         let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "recording" }).as_bytes()).await;
                     }
                     ClientMsg::Stop => {
                         info!("Received Stop command");
-                        if let Some((mut worker, ws_task)) = session.take() {
-                            // Stop audio
-                            worker.stop.store(true, Ordering::Relaxed);
-                            if let Some(join) = worker.join.take() {
-                                let _ = join.join();
-                            }
-                            // Move WS task to draining. Do NOT await it here.
-                            // This allows us to process new Start commands immediately.
+                        // Stop audio flow immediately
+                        audio_ctrl.clear_target();
+                        
+                        if let Some(ws_task) = session.take() {
+                            // Move WS task to draining.
                             if let Some(old_draining) = draining_task.replace(ws_task) {
-                                old_draining.abort(); // Should have been done, but safety first
+                                old_draining.abort(); 
                             }
                         } else {
-                            // If stopping but no active session, send idle just in case
                             let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "idle" }).as_bytes()).await;
                         }
                     }
                     ClientMsg::Cancel => {
                         info!("Received Cancel command");
-                        if let Some((mut worker, ws_task)) = session.take() {
-                            worker.stop.store(true, Ordering::Relaxed);
-                            if let Some(join) = worker.join.take() {
-                                let _ = join.join();
-                            }
+                        audio_ctrl.clear_target();
+                        if let Some(ws_task) = session.take() {
                             ws_task.abort(); 
                         }
                         if let Some(task) = draining_task.take() {
@@ -962,6 +958,9 @@ async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, cfg: AsrCo
             }
         }
     }
+    
+    // Ensure audio stops if client drops unexpectedly
+    audio_ctrl.clear_target();
 
     Ok(())
 }
@@ -1001,6 +1000,16 @@ async fn main() -> IoResult<()> {
     tokio::spawn(async move {
         pool_for_maintainer.run_maintainer().await;
     });
+    
+    // Start Persistent Audio Stream
+    // We keep _stream alive here in main.
+    let (_stream, audio_controller) = match start_global_audio() {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Failed to start global audio: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Aggressively take over the socket: delete if exists and bind fresh.
     if path.exists() {
@@ -1020,9 +1029,10 @@ async fn main() -> IoResult<()> {
                     Ok((stream, _)) => {
                         let pool_for_client = pool.clone();
                         let config_clone = config.clone();
+                        let audio_for_client = audio_controller.clone();
                         
                         tokio::spawn(async move {
-                            if let Err(err) = handle_client(stream, pool_for_client, config_clone).await {
+                            if let Err(err) = handle_client(stream, pool_for_client, audio_for_client, config_clone).await {
                                 error!("client error: {err}");
                             }
                             info!("Client handler finished.");
