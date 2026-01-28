@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <regex>
 #include <fcitx/userinterface.h>
+#include <fcntl.h>
 
 // --- AnyTalkStatusAction Implementation ---
 
@@ -21,8 +22,12 @@ std::string AnyTalkStatusAction::shortText(fcitx::InputContext *ic) const {
     if (engine_->isRecording()) {
         return "REC";
     }
-    if (engine_->connectionState() == "connecting") {
+    std::string state = engine_->connectionState();
+    if (state == "connecting") {
         return "...";
+    }
+    if (state == "connected") {
+        return "RDY";
     }
     return "AT";
 }
@@ -73,7 +78,7 @@ AnyTalkEngine::~AnyTalkEngine() {
 // Helper to trigger UI refresh
 void AnyTalkEngine::setStatus(const std::string &state) {
   current_state_ = state;
-  if (state == "idle") {
+  if (state == "idle" || state == "connected") {
     recording_ = false;
   } else if (state == "recording") {
     recording_ = true;
@@ -98,6 +103,7 @@ std::string AnyTalkEngine::subModeIconImpl(const fcitx::InputMethodEntry &, fcit
 std::string AnyTalkEngine::subModeLabelImpl(const fcitx::InputMethodEntry &, fcitx::InputContext &) {
     if (recording_) return "REC";
     if (current_state_ == "connecting") return "...";
+    if (current_state_ == "connected") return "RDY";
     return "AT";
 }
 
@@ -109,17 +115,28 @@ void AnyTalkEngine::startDaemon() {
     
     pid_t pid = fork();
     if (pid == 0) {
+        // Child process
         prctl(PR_SET_PDEATHSIG, SIGTERM);
         
         setenv("ANYTALK_APP_ID", config_.appId->c_str(), 1);
         setenv("ANYTALK_ACCESS_TOKEN", config_.accessToken->c_str(), 1);
         setenv("ANYTALK_RESOURCE_ID", "volc.seedasr.sauc.duration", 0);
+        // Ensure RUST_LOG is set so tracing defaults to info if not specified
+        setenv("RUST_LOG", "info", 0);
         
         std::string path = *config_.daemonPath;
         if (path.empty()) path = "anytalk-daemon";
 
         execlp(path.c_str(), path.c_str(), nullptr);
+        
+        // Only reached if execlp fails
+        // We can't log easily here since we removed redirection, 
+        // but fcitx might capture stderr or it goes to journal.
         _exit(1);
+    } else if (pid > 0) {
+        FCITX_INFO() << "Started anytalk-daemon with PID: " << pid;
+    } else {
+        FCITX_ERROR() << "Fork failed: " << strerror(errno);
     }
 }
 
@@ -168,7 +185,14 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
     if (!recording_) {
       ignore_next_commit_ = false;
       ipc_.sendStart();
-      setStatus("connecting"); // Optimistic update
+      // Don't set "connecting" blindly if we might be "connected" already.
+      // But sendStart will trigger daemon to send "recording" or "connecting".
+      // Let's just let the daemon drive the state updates to avoid flickering "..." if it's instant.
+      // But for responsiveness, "..." is okay. 
+      // Actually, if we are "connected", it should jump to "recording" very fast.
+      if (current_state_ != "connected") {
+          setStatus("connecting"); 
+      }
     } else {
       ipc_.sendStop();
       setStatus("idle"); // Optimistic update

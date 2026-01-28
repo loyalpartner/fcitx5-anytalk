@@ -9,11 +9,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const PROTO_VERSION: u8 = 0b0001;
 const HEADER_SIZE_4B: u8 = 0b0001;
@@ -31,7 +34,7 @@ const COMPRESSION_NONE: u8 = 0b0000;
 #[serde(tag = "type")]
 enum ClientMsg {
     #[serde(rename = "start")]
-    Start { mode: Option<String> },
+    Start { _mode: Option<String> },
     #[serde(rename = "stop")]
     Stop,
     #[serde(rename = "cancel")]
@@ -70,6 +73,71 @@ enum AudioMsg {
 struct AudioWorker {
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Manages a single "hot spare" connection.
+struct ConnectionPool {
+    /// The pre-connected stream.
+    spare: Arc<Mutex<Option<WsStream>>>,
+    /// Notify when the spare is consumed, so the background task can reconnect.
+    notify_consumed: Arc<Notify>,
+    /// Config to use for connecting.
+    config: AsrConfig,
+}
+
+impl ConnectionPool {
+    fn new(config: AsrConfig) -> Self {
+        Self {
+            spare: Arc::new(Mutex::new(None)),
+            notify_consumed: Arc::new(Notify::new()),
+            config,
+        }
+    }
+
+    /// Takes the spare connection if available.
+    async fn take(&self) -> Option<WsStream> {
+        let mut lock = self.spare.lock().await;
+        let stream = lock.take();
+        if stream.is_some() {
+            self.notify_consumed.notify_one();
+        }
+        stream
+    }
+
+    /// Background task to maintain the spare connection.
+    async fn run_maintainer(self: Arc<Self>) {
+        loop {
+            // Check if we need a connection
+            let needs_conn = {
+                let lock = self.spare.lock().await;
+                lock.is_none()
+            };
+
+            if needs_conn {
+                info!("Pre-connecting to Doubao...");
+                match connect_to_asr(&self.config).await {
+                    Ok(stream) => {
+                        info!("Pre-connection established. Ready.");
+                        let mut lock = self.spare.lock().await;
+                        *lock = Some(stream);
+                    }
+                    Err(e) => {
+                        error!("Pre-connection failed: {}. Retrying in 3s...", e);
+                        sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                }
+            }
+
+            // Wait until consumed
+            self.notify_consumed.notified().await;
+            // Slight delay to avoid hammering if something is spiraling,
+            // but short enough to be ready for the next phrase.
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 fn socket_path() -> PathBuf {
@@ -199,7 +267,7 @@ struct ParsedServerMessage {
     kind: &'static str,
     flags: u8,
     json_text: Option<String>,
-    error_code: Option<u32>,
+    _error_code: Option<u32>,
     error_msg: Option<String>,
 }
 
@@ -209,7 +277,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
             kind: "unknown",
             flags: 0,
             json_text: None,
-            error_code: None,
+            _error_code: None,
             error_msg: None,
         };
     }
@@ -224,7 +292,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
             kind: "unknown",
             flags: 0,
             json_text: None,
-            error_code: None,
+            _error_code: None,
             error_msg: None,
         };
     }
@@ -239,7 +307,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
                 kind: "unknown",
                 flags,
                 json_text: None,
-                error_code: None,
+                _error_code: None,
                 error_msg: None,
             };
         }
@@ -249,7 +317,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
                 kind: "unknown",
                 flags,
                 json_text: None,
-                error_code: None,
+                _error_code: None,
                 error_msg: None,
             };
         }
@@ -259,7 +327,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
             kind: "response",
             flags,
             json_text: Some(json_text),
-            error_code: None,
+            _error_code: None,
             error_msg: None,
         };
     }
@@ -270,7 +338,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
                 kind: "unknown",
                 flags,
                 json_text: None,
-                error_code: None,
+                _error_code: None,
                 error_msg: None,
             };
         }
@@ -281,7 +349,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
                 kind: "unknown",
                 flags,
                 json_text: None,
-                error_code: None,
+                _error_code: None,
                 error_msg: None,
             };
         }
@@ -290,7 +358,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
             kind: "error",
             flags,
             json_text: None,
-            error_code: Some(code),
+            _error_code: Some(code),
             error_msg: Some(msg),
         };
     }
@@ -299,7 +367,7 @@ fn parse_server_message(data: &[u8]) -> ParsedServerMessage {
         kind: "unknown",
         flags,
         json_text: None,
-        error_code: None,
+        _error_code: None,
         error_msg: None,
     }
 }
@@ -526,13 +594,9 @@ fn push_samples(
     }
 }
 
-async fn run_ws(
-    mut audio_rx: mpsc::Receiver<AudioMsg>,
-    resp_tx: mpsc::Sender<String>,
-    cfg: AsrConfig,
-) -> Result<(), String> {
+async fn connect_to_asr(cfg: &AsrConfig) -> Result<WsStream, String> {
     let url = asr_url(&cfg.mode);
-    info!("Connecting to ASR URL: {}", url);
+    debug!("Dialing ASR: {}", url);
     let mut request = url
         .into_client_request()
         .map_err(|e| format!("ws request error: {e}"))?;
@@ -562,7 +626,16 @@ async fn run_ws(
     let (ws_stream, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| format!("ws connect error: {e}"))?;
-    info!("WebSocket connected");
+    Ok(ws_stream)
+}
+
+async fn run_session(
+    ws_stream: WsStream,
+    mut audio_rx: mpsc::Receiver<AudioMsg>,
+    resp_tx: mpsc::Sender<String>,
+    cfg: AsrConfig,
+) -> Result<(), String> {
+    info!("Starting session on existing WS connection");
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     let req_json = default_request_json(&cfg.mode);
@@ -574,154 +647,81 @@ async fn run_ws(
         .map_err(|e| format!("ws send error: {e}"))?;
 
     let mut last_committed_end_time: i64 = -1;
-
     let mut last_full_text = String::new();
-
     let mut chunk_count = 0;
-
     let mut audio_active = true;
 
     loop {
         tokio::select! {
-
             audio = audio_rx.recv(), if audio_active => {
-
                 match audio {
-
                     Some(AudioMsg::Chunk(bytes)) => {
-
                         chunk_count += 1;
-
                         if chunk_count % 20 == 0 {
-
                             debug!("Sent 20 audio chunks to ASR...");
-
                         }
-
                         let frame = build_audio_only_request(&bytes, false);
-
                         if ws_write.send(Message::Binary(frame)).await.is_err() {
-
                             audio_active = false;
-
                         }
-
                     }
-
                     Some(AudioMsg::End(bytes)) => {
-
                         debug!("Sending final audio chunk");
-
                         let frame = build_audio_only_request(&bytes, true);
-
                         let _ = ws_write.send(Message::Binary(frame)).await;
-
                         audio_active = false;
-
                     }
-
                     None => {
-
                         debug!("Audio source channel closed");
-
                         audio_active = false;
-
                     }
-
                 }
-
             }
-
             msg = ws_read.next() => {
-
                 match msg {
-
                     Some(Ok(Message::Binary(data))) => {
-
                         let parsed = parse_server_message(&data);
-
                         if parsed.kind == "error" {
-
                             let msg = parsed.error_msg.unwrap_or_else(|| "server error".to_string());
-
                             error!("ASR Error: {}", msg);
-
                             let _ = resp_tx.send(serialize_msg(ServerMsg::Error { message: &msg })).await;
-
                             break;
-
                         }
-
                         if parsed.kind != "response" {
-
                             continue;
-
                         }
-
                         if let Some(json_text) = parsed.json_text {
-
                             debug!("ASR Response (flags={:b}): {}", parsed.flags, json_text);
-
                             let (partial, finals) = parse_asr_texts(&json_text, &mut last_committed_end_time, &mut last_full_text, cfg.mode.as_str());
-
                             if let Some(p) = partial {
-
                                 let _ = resp_tx.send(serialize_msg(ServerMsg::Partial { text: &p })).await;
-
                             }
-
                             for f in finals {
-
                                 debug!("Committing final text: {}", f);
-
                                 let _ = resp_tx.send(serialize_msg(ServerMsg::Final { text: &f })).await;
-
                             }
-
                             // 0b0011 means this is the final response frame from server
-
                             if parsed.flags == 0b0011 {
-
                                 info!("Received final server response frame. Closing.");
-
                                 break;
-
                             }
-
                         }
-
                     }
-
                     Some(Ok(Message::Close(_))) => {
-
                         info!("WebSocket closed by server");
-
                         break;
-
                     }
-
                     Some(Ok(_)) => {},
-
                     Some(Err(e)) => {
-
                         error!("WebSocket error: {}", e);
-
                         break;
-
                     }
-
                     None => {
-
                         debug!("WebSocket stream ended (None)");
-
                         break;
-
                     }
-
                 }
-
             }
-
         }
     }
 
@@ -812,15 +812,26 @@ fn serialize_msg(msg: ServerMsg<'_>) -> String {
     line
 }
 
-async fn handle_client(stream: UnixStream) -> IoResult<()> {
+async fn handle_client(stream: UnixStream, pool: Arc<ConnectionPool>, cfg: AsrConfig) -> IoResult<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
 
     let (resp_tx, mut resp_rx) = mpsc::channel::<String>(32);
 
+    // Active session: (AudioWorker, WebSocketTask)
     let mut session: Option<(AudioWorker, tokio::task::JoinHandle<()>)> = None;
+    // Task from a previous session that was stopped but is still finishing up (processing final results)
+    let mut draining_task: Option<tokio::task::JoinHandle<()>> = None;
 
-    info!("New client connected");
+    info!("New client connected to daemon");
+
+    // Immediately inform client if we are ready
+    {
+        let lock = pool.spare.lock().await;
+        if lock.is_some() {
+             let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "connected" }).as_bytes()).await;
+        }
+    }
 
     loop {
         tokio::select! {
@@ -837,19 +848,49 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
                 match msg {
                     ClientMsg::Start { .. } => {
                         info!("Received Start command");
-                        if session.is_some() {
-                            warn!("Session already active");
-                            continue;
+                        
+                        // 1. If there's a draining task (previous session finishing up), abort it.
+                        //    The user wants to start NOW, so we discard old results.
+                        if let Some(task) = draining_task.take() {
+                            info!("Aborting draining task from previous session");
+                            task.abort();
                         }
-                        let cfg = match load_asr_config() {
-                            Ok(v) => v,
-                            Err(err) => {
-                                error!("Config error: {}", err);
-                                let _ = write_half.write_all(serialize_msg(ServerMsg::Error { message: &err }).as_bytes()).await;
-                                continue;
+
+                        // 2. If there's an active session, abort it too (force restart).
+                        if let Some((mut worker, task)) = session.take() {
+                            warn!("Aborting active session for new Start");
+                            worker.stop.store(true, Ordering::Relaxed);
+                            // We don't join audio thread here to avoid blocking, 
+                            // strictly speaking we should, but aborting the task usually is enough 
+                            // as the audio worker relies on the channel which will close.
+                            // Better: join it if possible, but keep it quick.
+                            if let Some(join) = worker.join.take() {
+                                let _ = join.join();
+                            }
+                            task.abort();
+                        }
+
+                        // Try to get hot spare
+                        let maybe_ws = pool.take().await;
+                        let ws_stream = match maybe_ws {
+                            Some(s) => {
+                                info!("Using hot spare connection");
+                                s
+                            },
+                            None => {
+                                info!("No hot spare, connecting on demand...");
+                                let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "connecting" }).as_bytes()).await;
+                                match connect_to_asr(&cfg).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        error!("Connection failed: {}", e);
+                                        let _ = write_half.write_all(serialize_msg(ServerMsg::Error { message: &e }).as_bytes()).await;
+                                        continue;
+                                    }
+                                }
                             }
                         };
-                        let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "connecting" }).as_bytes()).await;
+                        
                         let (audio_worker, audio_rx) = match start_audio_worker() {
                             Ok(v) => v,
                             Err(err) => {
@@ -859,13 +900,15 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
                             }
                         };
                         let resp_tx_clone = resp_tx.clone();
+                        let cfg_clone = cfg.clone();
                         let ws_task = tokio::spawn(async move {
-                            if let Err(e) = run_ws(audio_rx, resp_tx_clone.clone(), cfg).await {
-                                error!("run_ws error: {}", e);
+                            if let Err(e) = run_session(ws_stream, audio_rx, resp_tx_clone.clone(), cfg_clone).await {
+                                error!("run_session error: {}", e);
                                 let _ = resp_tx_clone
                                     .send(serialize_msg(ServerMsg::Error { message: &e }))
                                     .await;
                             }
+                            // Session done (successfully or error)
                             let _ = resp_tx_clone
                                 .send(serialize_msg(ServerMsg::Status { state: "idle" }))
                                 .await;
@@ -876,13 +919,20 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
                     ClientMsg::Stop => {
                         info!("Received Stop command");
                         if let Some((mut worker, ws_task)) = session.take() {
+                            // Stop audio
                             worker.stop.store(true, Ordering::Relaxed);
                             if let Some(join) = worker.join.take() {
                                 let _ = join.join();
                             }
-                            let _ = ws_task.await;
+                            // Move WS task to draining. Do NOT await it here.
+                            // This allows us to process new Start commands immediately.
+                            if let Some(old_draining) = draining_task.replace(ws_task) {
+                                old_draining.abort(); // Should have been done, but safety first
+                            }
+                        } else {
+                            // If stopping but no active session, send idle just in case
+                            let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "idle" }).as_bytes()).await;
                         }
-                        let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "idle" }).as_bytes()).await;
                     }
                     ClientMsg::Cancel => {
                         info!("Received Cancel command");
@@ -891,7 +941,10 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
                             if let Some(join) = worker.join.take() {
                                 let _ = join.join();
                             }
-                            ws_task.abort(); // Force abort for Cancel
+                            ws_task.abort(); 
+                        }
+                        if let Some(task) = draining_task.take() {
+                            task.abort();
                         }
                         let _ = write_half.write_all(serialize_msg(ServerMsg::Status { state: "idle" }).as_bytes()).await;
                     }
@@ -914,59 +967,89 @@ async fn handle_client(stream: UnixStream) -> IoResult<()> {
 }
 
 #[tokio::main]
-
 async fn main() -> IoResult<()> {
+    // Setup Tracing (Logging to file)
+    let file_appender = tracing_appender::rolling::never("/tmp", "anytalk-daemon.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_ansi(false) // Disable colors in file
+        .init();
 
+    info!("--------------------------------------------------------------------------------");
+    info!("anytalk-daemon started. Logging to /tmp/anytalk-daemon.log");
+    
     rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
 
-
-
     let path = socket_path();
-
     
-
-    // Check if another instance is running
-
-    if path.exists() {
-
-        match UnixStream::connect(&path).await {
-
-            Ok(_) => {
-
-                error!("Another instance of anytalk-daemon is already running.");
-
-                return Ok(());
-
-            }
-
-            Err(_) => {
-
-                warn!("Removing stale socket file: {}", path.display());
-
-                let _ = std::fs::remove_file(&path);
-
-            }
-
+    let config = match load_asr_config() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Startup Config Error: {}", e);
+            // We exit if config is missing, as we can't connect
+            std::process::exit(1);
         }
+    };
 
+    let pool = Arc::new(ConnectionPool::new(config.clone()));
+    let pool_for_maintainer = pool.clone();
+
+    // Start background connection maintainer
+    tokio::spawn(async move {
+        pool_for_maintainer.run_maintainer().await;
+    });
+
+    // Aggressively take over the socket: delete if exists and bind fresh.
+    if path.exists() {
+        info!("Removing existing socket file: {}", path.display());
+        let _ = std::fs::remove_file(&path);
     }
-
-
 
     let listener = UnixListener::bind(&path)?;
-
     info!("anytalk-daemon listening on {}", path.display());
 
-
-
+    let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    
     loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            if let Err(err) = handle_client(stream).await {
-                error!("client error: {err}");
+        tokio::select! {
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, _)) => {
+                        let pool_for_client = pool.clone();
+                        let config_clone = config.clone();
+                        
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_client(stream, pool_for_client, config_clone).await {
+                                error!("client error: {err}");
+                            }
+                            info!("Client handler finished.");
+                        });
+                    }
+                    Err(e) => {
+                        error!("Accept error: {}", e);
+                        break;
+                    }
+                }
             }
-        });
+            _ = tokio::signal::ctrl_c() => {
+                 info!("SIGINT (Ctrl+C) received. Exiting.");
+                 break;
+            }
+            _ = sig_term.recv() => {
+                 info!("SIGTERM received. Exiting.");
+                 break;
+            }
+        }
     }
+    
+    // Cleanup socket file
+    if path.exists() {
+        info!("Cleaning up socket file: {}", path.display());
+        let _ = std::fs::remove_file(&path);
+    }
+    
+    Ok(())
 }
