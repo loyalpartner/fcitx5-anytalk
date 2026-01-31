@@ -3,7 +3,10 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs;
 use std::io::Result as IoResult;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -1011,13 +1014,37 @@ async fn main() -> IoResult<()> {
         }
     };
 
-    // Aggressively take over the socket: delete if exists and bind fresh.
+    // Take over the socket if stale. If another daemon is still alive, exit.
     if path.exists() {
-        info!("Removing existing socket file: {}", path.display());
-        let _ = std::fs::remove_file(&path);
+        let mut stale = false;
+        for attempt in 0..5 {
+            match StdUnixStream::connect(&path) {
+                Ok(_) => {
+                    if attempt == 0 {
+                        warn!("Another daemon is running; waiting briefly to see if it exits...");
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => {
+                    info!(
+                        "Removing stale socket file {} (connect failed: {})",
+                        path.display(),
+                        e
+                    );
+                    let _ = fs::remove_file(&path);
+                    stale = true;
+                    break;
+                }
+            }
+        }
+        if !stale {
+            error!("anytalk-daemon already running; exiting.");
+            return Ok(());
+        }
     }
 
     let listener = UnixListener::bind(&path)?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     info!("anytalk-daemon listening on {}", path.display());
 
     let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

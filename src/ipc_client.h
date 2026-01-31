@@ -3,6 +3,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 class IpcClient {
 public:
@@ -22,8 +23,11 @@ private:
   void connectSocket();
   void recvLoop();
   void sendJson(const std::string &json);
+  void closeSocketLocked();
 
   int sock_{-1};
+  std::mutex sock_mutex_;
+  std::string recv_buffer_;
   std::thread recv_thread_;
   std::atomic<bool> running_{false};
 

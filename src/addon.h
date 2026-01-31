@@ -63,5 +63,6 @@ private:
   bool ignore_next_commit_{false};
   std::string last_text_;
   std::string current_state_{"idle"};
+  fcitx::InputContext *active_ic_{nullptr};
   std::unique_ptr<AnyTalkStatusAction> statusAction_;
 };

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <cerrno>
 #include <json-c/json.h>
 #include <fcitx-utils/log.h>
 
@@ -36,10 +37,9 @@ void IpcClient::start() {
 
 void IpcClient::stop() {
   running_ = false;
-  if (sock_ >= 0) {
-    ::shutdown(sock_, SHUT_RDWR);
-    ::close(sock_);
-    sock_ = -1;
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    closeSocketLocked();
   }
   if (recv_thread_.joinable()) {
     recv_thread_.join();
@@ -47,10 +47,13 @@ void IpcClient::stop() {
 }
 
 void IpcClient::connectSocket() {
-  if (sock_ >= 0) return;
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    if (sock_ >= 0) return;
+  }
 
-  sock_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sock_ < 0) {
+  int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
     FCITX_ERROR() << "Failed to create socket";
     return;
   }
@@ -62,22 +65,63 @@ void IpcClient::connectSocket() {
 
   FCITX_DEBUG() << "Connecting to " << path;
 
-  if (::connect(sock_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-    ::close(sock_);
-    sock_ = -1;
-  } else {
-    FCITX_DEBUG() << "Connected to " << path;
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    ::close(fd);
+    return;
+  }
+  FCITX_DEBUG() << "Connected to " << path;
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    if (sock_ >= 0) {
+      ::close(fd);
+      return;
+    }
+    sock_ = fd;
+    recv_buffer_.clear();
   }
 }
 
 void IpcClient::sendJson(const std::string &json) {
-  if (sock_ < 0) {
+  bool need_connect = false;
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    need_connect = sock_ < 0;
+  }
+  if (need_connect) {
+    connectSocket();
+  }
+
+  int fd = -1;
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    fd = sock_;
+  }
+  if (fd < 0) {
     FCITX_ERROR() << "Socket not connected, cannot send: " << json;
     return;
   }
   FCITX_DEBUG() << "Sending JSON: " << json;
-  ::send(sock_, json.data(), json.size(), 0);
-  ::send(sock_, "\n", 1, 0);
+  auto send_all = [&](const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+      ssize_t n = ::send(fd, data + sent, len - sent, 0);
+      if (n > 0) {
+        sent += static_cast<size_t>(n);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  };
+  if (!send_all(json.data(), json.size()) || !send_all("\n", 1)) {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    if (sock_ == fd) {
+      closeSocketLocked();
+    }
+  }
 }
 
 void IpcClient::sendStart() {
@@ -94,30 +138,55 @@ void IpcClient::sendCancel() {
 
 void IpcClient::recvLoop() {
   while (running_) {
-    if (sock_ < 0) {
+    bool need_connect = false;
+    {
+      std::lock_guard<std::mutex> lock(sock_mutex_);
+      need_connect = sock_ < 0;
+    }
+    if (need_connect) {
       connectSocket();
-      if (sock_ < 0) {
+      {
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        need_connect = sock_ < 0;
+      }
+      if (need_connect) {
         ::usleep(200 * 1000);
         continue;
       }
     }
 
     char buf[4096];
-    ssize_t n = ::recv(sock_, buf, sizeof(buf) - 1, 0);
+    int fd = -1;
+    {
+      std::lock_guard<std::mutex> lock(sock_mutex_);
+      fd = sock_;
+    }
+    if (fd < 0) {
+      continue;
+    }
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) {
-      ::close(sock_);
-      sock_ = -1;
+      {
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        if (sock_ == fd) {
+          closeSocketLocked();
+        }
+      }
       if (on_status_) {
           on_status_("idle");
       }
       continue;
     }
-    buf[n] = '\0';
 
-    char *saveptr = nullptr;
-    char *line = ::strtok_r(buf, "\n", &saveptr);
-    while (line) {
-      json_object *obj = json_tokener_parse(line);
+    recv_buffer_.append(buf, static_cast<size_t>(n));
+    size_t pos = 0;
+    while ((pos = recv_buffer_.find('\n')) != std::string::npos) {
+      std::string line = recv_buffer_.substr(0, pos);
+      recv_buffer_.erase(0, pos + 1);
+      if (line.empty()) {
+        continue;
+      }
+      json_object *obj = json_tokener_parse(line.c_str());
       if (obj) {
         json_object *type_obj = nullptr;
         if (json_object_object_get_ex(obj, "type", &type_obj)) {
@@ -141,7 +210,15 @@ void IpcClient::recvLoop() {
         }
         json_object_put(obj);
       }
-      line = ::strtok_r(nullptr, "\n", &saveptr);
     }
   }
+}
+
+void IpcClient::closeSocketLocked() {
+  if (sock_ >= 0) {
+    ::shutdown(sock_, SHUT_RDWR);
+    ::close(sock_);
+    sock_ = -1;
+  }
+  recv_buffer_.clear();
 }

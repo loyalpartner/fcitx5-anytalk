@@ -78,7 +78,10 @@ AnyTalkEngine::~AnyTalkEngine() {
 // Helper to trigger UI refresh
 void AnyTalkEngine::setStatus(const std::string &state) {
   current_state_ = state;
-  if (state == "idle" || state == "connected") {
+  if (state == "idle") {
+    recording_ = false;
+    active_ic_ = nullptr;
+  } else if (state == "connected") {
     recording_ = false;
   } else if (state == "recording") {
     recording_ = true;
@@ -158,7 +161,10 @@ void AnyTalkEngine::activate(const fcitx::InputMethodEntry &, fcitx::InputContex
     statusAction_->update(ic);
 }
 
-void AnyTalkEngine::deactivate(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &) {
+void AnyTalkEngine::deactivate(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) {
+    if (event.inputContext() == active_ic_) {
+        active_ic_ = nullptr;
+    }
 }
 
 void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &event) {
@@ -183,6 +189,7 @@ void AnyTalkEngine::keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &e
   // F2 or Media Play key
   if (event.key().sym() == FcitxKey_F2 || event.key().sym() == FcitxKey_AudioPlay) {
     if (!recording_) {
+      active_ic_ = ic;
       ignore_next_commit_ = false;
       ipc_.sendStart();
       if (current_state_ != "connected") {
@@ -201,7 +208,8 @@ void AnyTalkEngine::updatePreedit(const std::string &text) {
   if (!instance_) return;
   
   last_text_ = text;
-  auto *ic = instance_->inputContextManager().lastFocusedInputContext();
+  auto *focused = instance_->inputContextManager().lastFocusedInputContext();
+  auto *ic = active_ic_ ? (active_ic_ == focused ? active_ic_ : nullptr) : focused;
   if (!ic) return;
   fcitx::Text preedit(text);
   ic->inputPanel().setClientPreedit(preedit);
@@ -212,7 +220,8 @@ void AnyTalkEngine::commitText(const std::string &text) {
   if (ignore_next_commit_) return;
   if (!instance_) return;
   last_text_ = "";
-  auto *ic = instance_->inputContextManager().lastFocusedInputContext();
+  auto *focused = instance_->inputContextManager().lastFocusedInputContext();
+  auto *ic = active_ic_ ? (active_ic_ == focused ? active_ic_ : nullptr) : focused;
   if (!ic) return;
   ic->commitString(text);
   ic->inputPanel().setClientPreedit(fcitx::Text());
